@@ -1,1 +1,8 @@
-zlib1g-dev
+zlib1g-dev  
+libjpeg-dev  
+libpng-dev  
+libtiff-dev  
+libwebp-dev  
+libfreetype6-dev  
+liblcms2-dev  
+libopenjp2-7-dev 
