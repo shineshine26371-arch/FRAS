@@ -162,12 +162,14 @@ def _apply_workflow_rules(file_id: int) -> None:
 
 
 def _get_clean_text(file_id: int) -> str:
-    """Get document text for risk re-detection."""
+    """Get document text for risk re-detection.
+    Uses text-only extraction to avoid passing base64 image data
+    to text-based AI prompts."""
     file = get_file(file_id)
     if not file:
         return ""
-    from openrouter_client import _extract_text_from_file
-    return _extract_text_from_file(file["filepath"], file["file_type"])
+    from openrouter_client import _extract_text_content_for_text_only
+    return _extract_text_content_for_text_only(file["filepath"], file["file_type"])
 
 
 def _parse_json_field(value: Any, default: Any = None) -> Any:
@@ -627,7 +629,7 @@ def render_ask_tab() -> None:
 
     if st.button("Ask", type="primary", key="ask_button"):
         with st.spinner("Analyzing documents to answer your question..."):
-            from openrouter_client import _extract_text_from_file
+            from openrouter_client import _extract_text_content_for_text_only
 
             # Gather document context
             doc_contexts = []
@@ -643,9 +645,9 @@ def render_ask_tab() -> None:
                         "structured_data": extracted.get("structured_data", "{}"),
                         "risks": extracted.get("risks", "[]"),
                     }
-                    # If reasoning mode, include full document text
+                    # If reasoning mode, include full document text (text-only for scanned PDFs)
                     if enable_reasoning:
-                        doc_item["full_text"] = _extract_text_from_file(
+                        doc_item["full_text"] = _extract_text_content_for_text_only(
                             file["filepath"], file["file_type"]
                         )
                     doc_contexts.append(doc_item)

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import re
 import time
 from typing import Any
 
+import fitz  # PyMuPDF for OCR fallback on scanned PDFs
 from dotenv import load_dotenv
+from PIL import Image
 from PyPDF2 import PdfReader
 
 load_dotenv(override=True)
@@ -107,7 +110,7 @@ def _call_openrouter_with_backoff(
             response = _client.chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=4000,
+                max_tokens=6000,
             )
             _last_call_timestamp = time.time()
             return response.choices[0].message.content or ""
@@ -132,11 +135,54 @@ def _call_openrouter_with_backoff(
     raise last_exception  # type: ignore[misc]
 
 
+def _pdf_has_text_layer(file_path: str) -> bool:
+    """Check if a PDF has extractable text (vs. being a scanned/image-only PDF)."""
+    try:
+        reader = PdfReader(file_path)
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if len(text.strip()) > 20:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _extract_pdf_as_images_base64(file_path: str) -> str:
+    """
+    Render PDF pages as images using PyMuPDF and return base64-encoded JPEG data.
+    Multiple pages are concatenated with a marker.
+    Returns: base64 data (up to max 5 pages, using JPEG at 72 DPI to keep payload minimal)
+    """
+    doc = fitz.open(file_path)
+    page_images = []
+    # Limit to 5 pages max and 72 DPI to stay within free tier token limits
+    max_pages = min(len(doc), 5)
+
+    for page_num in range(max_pages):
+        page = doc[page_num]
+        # Render page at 72 DPI - minimal for OCR, saves token budget
+        pix = page.get_pixmap(dpi=72)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        buf = io.BytesIO()
+        # Use JPEG at quality 70 - aggressive compression for token economy
+        img.save(buf, format="JPEG", quality=70, optimize=True)
+        page_images.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+
+    doc.close()
+    # Join multiple pages with a marker for the vision model to process
+    return "===MULTI_PAGE_PDF===" + "|||".join(page_images)
+
+
 def _extract_text_from_file(file_path: str, file_type: str) -> str:
     """Extract text content from uploaded file for processing."""
     if file_type == ".pdf":
         reader = PdfReader(file_path)
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        # If no text layer detected (scanned PDF), fall back to image-based extraction
+        if not text or len(text.strip()) < 20:
+            return _extract_pdf_as_images_base64(file_path)
+        return text
     elif file_type in {".txt"}:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
@@ -153,9 +199,67 @@ def _extract_text_from_file(file_path: str, file_type: str) -> str:
             return ""
 
 
+def _extract_text_content_for_text_only(file_path: str, file_type: str) -> str:
+    """
+    Extract text content for use in text-only contexts (risk detection, ask tab,
+    report generation). For scanned PDFs without text layers, returns a
+    descriptive placeholder since the content is only available via vision model.
+    """
+    raw = _extract_text_from_file(file_path, file_type)
+    # If the result is base64 image data, return a placeholder instead
+    if raw.startswith("===MULTI_PAGE_PDF===") or file_type in {".png", ".jpg", ".jpeg"} and len(raw) > 100:
+        from pathlib import Path
+        return f"[Scanned document: {Path(file_path).name}. Content is only available via the vision model during document processing.]"
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # Main Extraction Pipeline
 # ---------------------------------------------------------------------------
+
+def _build_vision_messages_for_pdf(text_content: str) -> list[dict[str, Any]]:
+    """
+    Build a vision API message payload from base64-encoded PDF page images.
+    The text_content contains the marker '===MULTI_PAGE_PDF===' followed by
+    '|||'-separated base64 PNG data for each page.
+    """
+    pages_base64 = text_content.split("===MULTI_PAGE_PDF===", 1)[1].split("|||")
+
+    # Build content array: instruction text + each page as an image
+    content_parts: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": """You are analyzing a scanned PDF document that has been converted to images. 
+Examine ALL pages carefully and return ONLY a valid JSON object (no markdown fences, no extra text) with these exact keys:
+- "summary": a 2-4 sentence plain-language summary of the document
+- "key_points": a list of the most critical facts, figures, or action items
+- "document_type": your best guess (report, invoice, memo, contract, brochure, etc.)
+- "entities": a flat list of people, organizations, dates, and amounts mentioned
+
+If the document is an invoice, also include:
+- "structured_data": {"amount": number, "due_date": "YYYY-MM-DD", "vendor": "..."}
+If the document is a contract, also include:
+- "structured_data": {"parties": ["..."], "duration": "...", "obligations": "..."}
+Otherwise, include "structured_data": {}
+
+Example format:
+{"summary": "...", "key_points": ["..."], "document_type": "...", "entities": ["..."], "structured_data": {}}""",
+        },
+    ]
+
+    for i, b64_page in enumerate(pages_base64):
+        if b64_page.strip():
+            content_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64_page}",
+                    },
+                }
+            )
+
+    return [{"role": "user", "content": content_parts}]
+
 
 def extract_document_content(file_path: str, file_type: str) -> dict[str, Any]:
     """
@@ -167,8 +271,14 @@ def extract_document_content(file_path: str, file_type: str) -> dict[str, Any]:
 
     text_content = _extract_text_from_file(file_path, file_type)
 
-    if file_type in {".png", ".jpg", ".jpeg"}:
-        # Use vision model for images
+    # Detect if this is a scanned PDF rendered as images
+    is_scanned_pdf = text_content.startswith("===MULTI_PAGE_PDF===")
+
+    if is_scanned_pdf:
+        # Use vision model for scanned PDFs (rendered as page images)
+        messages = _build_vision_messages_for_pdf(text_content)
+    elif file_type in {".png", ".jpg", ".jpeg"}:
+        # Use vision model for regular images
         messages = [
             {
                 "role": "user",
@@ -239,10 +349,40 @@ Example format:
 
         # Second pass: Risk detection (non-blocking, failure won't break main extraction)
         try:
-            risk_messages = [
-                {
-                    "role": "user",
-                    "content": f"""Analyze this document and identify risks, inconsistencies, or missing critical information.
+            risk_messages_content: str | list[dict[str, Any]]
+            if is_scanned_pdf:
+                # For scanned PDFs, reuse the vision-based risk detection
+                risk_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": """Analyze this scanned document and identify risks, inconsistencies, or missing critical information.
+Return ONLY a valid JSON object with this exact key:
+- "risks": a list of strings describing risks found (empty list if none)
+
+Example format:
+{"risks": ["Risk 1", "Risk 2"]}""",
+                            },
+                        ],
+                    }
+                ]
+                # Add the page images to risk messages
+                pages_base64 = text_content.split("===MULTI_PAGE_PDF===", 1)[1].split("|||")
+                for b64_page in pages_base64:
+                    if b64_page.strip():
+                        risk_messages[0]["content"].append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64_page}"},
+                            }
+                        )
+            else:
+                risk_messages = [
+                    {
+                        "role": "user",
+                        "content": f"""Analyze this document and identify risks, inconsistencies, or missing critical information.
 Return ONLY a valid JSON object with this exact key:
 - "risks": a list of strings describing risks found (empty list if none)
 
@@ -251,8 +391,8 @@ Document content:
 
 Example format:
 {{"risks": ["Risk 1", "Risk 2"]}}""",
-                }
-            ]
+                    }
+                ]
             risk_response = _call_openrouter_with_backoff(model, risk_messages)
             risk_parsed = _parse_json(risk_response)
             result["risks"] = json.dumps(risk_parsed.get("risks", []))
