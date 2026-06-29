@@ -267,7 +267,7 @@ def extract_document_content(file_path: str, file_type: str) -> dict[str, Any]:
     Returns dict with: summary, key_points, document_type, entities, raw_response,
                        risks, structured_data
     """
-    model = "google/gemini-2.0-flash-exp:free"
+    model = "meta-llama/llama-3.3-70b-instruct:free"
 
     text_content = _extract_text_from_file(file_path, file_type)
 
@@ -416,7 +416,7 @@ def ask_documents(documents: list[dict[str, Any]], question: str) -> dict[str, A
     question: natural language question
     Returns dict with: answer, sources
     """
-    model = "google/gemini-2.0-flash-exp:free"
+    model = "meta-llama/llama-3.3-70b-instruct:free"
 
     docs_context = "\n\n".join(
         f"Document: {doc['filename']}\nSummary: {doc['summary']}\nKey Points: {doc.get('key_points', 'N/A')}"
@@ -468,7 +468,7 @@ def generate_insights(documents: list[dict[str, Any]]) -> dict[str, Any]:
     documents: list of dicts with keys: filename, summary, key_points, entities
     Returns dict with: issues, entities, trends, risks
     """
-    model = "google/gemini-2.0-flash-exp:free"
+    model = "meta-llama/llama-3.3-70b-instruct:free"
 
     docs_context = "\n\n".join(
         f"Document: {doc['filename']}\nSummary: {doc['summary']}\nKey Points: {doc.get('key_points', 'N/A')}\nEntities: {doc.get('entities', 'N/A')}"
@@ -517,7 +517,7 @@ def detect_risks(text_content: str) -> list[str]:
     Standalone risk detection pass on a document text.
     Returns list of risk strings.
     """
-    model = "google/gemini-2.0-flash-exp:free"
+    model = "meta-llama/llama-3.3-70b-instruct:free"
 
     messages = [
         {
@@ -552,7 +552,7 @@ def semantic_search(query: str, documents: list[dict[str, Any]]) -> list[str]:
     documents: list of dicts with keys: filename, summary, key_points
     Returns list of matching filenames.
     """
-    model = "google/gemini-2.0-flash-exp:free"
+    model = "meta-llama/llama-3.3-70b-instruct:free"
 
     docs_context = "\n\n".join(
         f"Filename: {doc['filename']}\nSummary: {doc['summary']}\nKey Points: {doc.get('key_points', 'N/A')}"
@@ -598,7 +598,7 @@ def generate_report_content(
     selected_summaries: list of dicts with 'filename', 'summary', 'key_points'
     Returns the report as Markdown text.
     """
-    model = "google/gemini-2.0-flash-exp:free"
+    model = "meta-llama/llama-3.3-70b-instruct:free"
 
     sections = report_sections or [
         "Overview",
